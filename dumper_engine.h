@@ -8,11 +8,12 @@
 #include <functional>
 #include <cmath>
 #include <algorithm>
+#include <regex>
 #include <iostream>
 #include <memory>
 #include <glm/glm.hpp>
 
-// --- BELLEK OKUMA MOTORU (PROCESS/MEMORY) ---
+// --- BELLEK OKUMA VE YAZMA MOTORU ---
 namespace process {
     class Memory {
     private:
@@ -23,7 +24,6 @@ namespace process {
         static auto attach(const std::string& processName) -> bool {
             PROCESSENTRY32 entry;
             entry.dwSize = sizeof(PROCESSENTRY32);
-
             HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, NULL);
             if (snapshot == INVALID_HANDLE_VALUE) return false;
 
@@ -37,7 +37,6 @@ namespace process {
                     }
                 } while (Process32Next(snapshot, &entry));
             }
-
             CloseHandle(snapshot);
             return false;
         }
@@ -68,7 +67,7 @@ namespace process {
     };
 }
 
-// --- RTTI / SINIF ADI ÇÖZÜCÜ (PROCESS/RTTI) ---
+// --- RTTI / SINIF ADI BULUCU ---
 namespace process {
     class Rtti {
     public:
@@ -76,22 +75,17 @@ namespace process {
             if (!inst_address) return "";
             uintptr_t vtable = process::Memory::read<uintptr_t>(inst_address);
             if (!vtable) return "";
-
             uintptr_t col = process::Memory::read<uintptr_t>(vtable - sizeof(uintptr_t));
             if (!col) return "";
-
             uintptr_t type_desc = process::Memory::read<uintptr_t>(col + 0xC);
             if (!type_desc) return "";
-
-            std::string raw_name = process::Memory::read_string(type_desc + 0x10, 128);
-            return raw_name;
+            return process::Memory::read_string(type_desc + 0x10, 128);
         }
 
         static auto find(uintptr_t base_address, const std::string& target_class) -> std::optional<size_t> {
             for (size_t offset = 0; offset < 0x1000; offset += sizeof(uintptr_t)) {
                 uintptr_t child = process::Memory::read<uintptr_t>(base_address + offset);
                 if (!child) continue;
-
                 if (get_class_name(child).find(target_class) != std::string::npos) {
                     return offset;
                 }
@@ -110,7 +104,7 @@ namespace process {
     };
 }
 
-// --- ARAMA ALGORİTMALARI (PROCESS/HELPERS) ---
+// --- DİNAMİK BELLEK TARAMA YARDIMCILARI ---
 namespace process::helpers {
     template<typename T>
     inline auto find_offset_with_getter(
@@ -195,14 +189,37 @@ namespace process::helpers {
         }
         return std::nullopt;
     }
+
+    // String tarayıcı (Örn: DisplayName)
+    inline auto find_string_offset(uintptr_t base, const std::string& target, size_t max, size_t align, size_t str_max, bool is_unicode) -> std::optional<size_t> {
+        for (size_t offset = 0; offset < max; offset += align) {
+            std::string current = process::Memory::read_string(base + offset, str_max);
+            if (current == target) {
+                return offset;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Düzenli ifade (regex) ile string tarayıcı (Örn: LocaleId)
+    inline auto find_string_by_regex(uintptr_t base, const std::string& pattern, size_t max, size_t align, size_t str_max, bool is_unicode) -> std::optional<size_t> {
+        std::regex r(pattern);
+        for (size_t offset = 0; offset < max; offset += align) {
+            std::string current = process::Memory::read_string(base + offset, str_max);
+            if (std::regex_match(current, r)) {
+                return offset;
+            }
+        }
+        return std::nullopt;
+    }
 }
 
-// --- DUMPER ORTAK ALTYAPISI (DUMPER) ---
+// --- INSAN VE ORTAK YAPILAR ---
 namespace dumper {
     class Instance {
     public:
-        bool is_valid() const { return get_address() != 0; }
-        uintptr_t get_address() const { return 0xDEADBEEF; } // Gerçek taramada güncellenir
+        bool is_valid() const { return true; }
+        uintptr_t get_address() const { return 0xDEADBEEF; }
         std::shared_ptr<Instance> find_first_child(const std::string& name) {
             return std::make_shared<Instance>();
         }
@@ -214,16 +231,24 @@ namespace dumper {
     class Dumper {
     public:
         void add_offset(const std::string& category, const std::string& name, size_t val) {
-            std::cout << "[" << category << "] " << name << " -> Offset: 0x" << std::hex << val << std::endl;
+            std::cout << "[" << category << "] " << name << " found at offset: 0x" << std::hex << val << std::endl;
         }
     };
 
     inline std::shared_ptr<Instance> g_workspace = std::make_shared<Instance>();
+    inline Instance g_data_model;
+    inline uintptr_t g_team_addr = 0xBC840;
     inline Dumper g_dumper;
 }
 
-// --- SUNUCU ILE ILETISIM YAPILARI (CONTROL/CLIENT) ---
+// --- SUNUCU ILE ILETISIM VERILERI ---
 namespace control::client {
+    struct PlayerInfo {
+        uint64_t user_id = 12345678;
+        std::string display_name = "PlayerOne";
+        uint32_t account_age = 365;
+    };
+
     struct HumanoidProperty {
         std::string name;
         float health = 100.0f;
@@ -258,6 +283,9 @@ namespace control::client {
 
     class Client {
     public:
+        std::optional<PlayerInfo> get_player_information() {
+            return PlayerInfo{};
+        }
         std::optional<HumanoidPropertiesInfo> get_humanoid_properties() {
             HumanoidPropertiesInfo info;
             info.humanoids = {{"SittingNPC"}, {"EnemyNPC"}, {"Player"}};
@@ -268,7 +296,10 @@ namespace control::client {
     inline Client g_client;
 }
 
-// --- GEREKLI MAKROLAR (DUMPER/MACROS) ---
+// --- MACRO TANIMLARI ---
 #define FIND_AND_ADD_OFFSET(addr, stage, type, name, val, max, align) \
-    dumper::g_dumper.add_offset(#stage, #name, 0x1A0);
+    { \
+        auto res = process::helpers::find_offset_with_getter<type>({addr}, [&](size_t) { return val; }, max, align); \
+        if (res) dumper::g_dumper.add_offset(#stage, #name, *res); \
+}
 
